@@ -68,12 +68,19 @@ jobs:
             echo "::error::Debes ingresar el código de croc que te mostró el script en tu Linux."
             exit 1
           fi
-          mkdir -p "$RUNNER_TEMP/payload"
+          mkdir -p "$RUNNER_TEMP/payload" "$RUNNER_TEMP/game" "$RUNNER_TEMP/keys"
           cd "$RUNNER_TEMP/payload"
-          CROC_SECRET="$CROC_SECRET" croc --yes --overwrite
-          mkdir -p "$RUNNER_TEMP/game" "$RUNNER_TEMP/keys"
-          find . -maxdepth 3 -iname "*prod.keys*" -exec mv {} "$RUNNER_TEMP/keys/prod.keys" \;
-          find . -maxdepth 3 \( -iname "*.nsp" -o -iname "*.nsz" -o -iname "*.xci" -o -iname "*.xcz" \) -exec mv {} "$RUNNER_TEMP/game/" \;
+          for attempt in $(seq 1 36); do
+            echo "Intento $attempt: conectando con tu Linux via croc..."
+            if CROC_SECRET="$CROC_SECRET" croc --yes --overwrite; then
+              find . -maxdepth 3 -iname "*prod.keys*" -exec mv {} "$RUNNER_TEMP/keys/prod.keys" \;
+              find . -maxdepth 3 \( -iname "*.nsp" -o -iname "*.nsz" -o -iname "*.xci" -o -iname "*.xcz" \) -exec mv {} "$RUNNER_TEMP/game/" \;
+              if [ -f "$RUNNER_TEMP/keys/prod.keys" ] && [ -n "$(ls -A "$RUNNER_TEMP/game/" 2>/dev/null)" ]; then
+                break
+              fi
+            fi
+            sleep 5
+          done
           ls -lh "$RUNNER_TEMP/game/" "$RUNNER_TEMP/keys/"
 
       - name: Download NSP and prod.keys via URL / Google Drive
