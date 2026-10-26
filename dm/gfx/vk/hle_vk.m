@@ -16,6 +16,7 @@
 #define VK_NO_PROTOTYPES
 #include "../../host/hle.h"
 #include "../nvn/nvn_mtl.h"
+#include "../tex/nvn_bcdec.h"
 #include <vulkan/vulkan_core.h>
 #include <vulkan/vulkan_vi.h>
 #import <Metal/Metal.h>
@@ -112,8 +113,40 @@ static const fmt_t *fmt_of(VkFormat f) {
 static int fmt_has_depth(const fmt_t *f) { return f && (f->kind == K_DEPTH || f->kind == K_DS); }
 static int fmt_has_stencil(const fmt_t *f) { return f && (f->kind == K_STENCIL || f->kind == K_DS); }
 
+static uint32_t vk_to_nvn_bc(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_BC1_RGB_UNORM_BLOCK: return 0x41;
+        case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return 0x42;
+        case VK_FORMAT_BC2_UNORM_BLOCK: return 0x43;
+        case VK_FORMAT_BC3_UNORM_BLOCK: return 0x44;
+        case VK_FORMAT_BC1_RGB_SRGB_BLOCK: return 0x45;
+        case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: return 0x46;
+        case VK_FORMAT_BC2_SRGB_BLOCK: return 0x47;
+        case VK_FORMAT_BC3_SRGB_BLOCK: return 0x48;
+        case VK_FORMAT_BC4_UNORM_BLOCK: return 0x49;
+        case VK_FORMAT_BC4_SNORM_BLOCK: return 0x4a;
+        case VK_FORMAT_BC5_UNORM_BLOCK: return 0x4b;
+        case VK_FORMAT_BC5_SNORM_BLOCK: return 0x4c;
+        case VK_FORMAT_BC7_UNORM_BLOCK: return 0x4d;
+        case VK_FORMAT_BC7_SRGB_BLOCK: return 0x4e;
+        case VK_FORMAT_BC6H_SFLOAT_BLOCK: return 0x4f;
+        case VK_FORMAT_BC6H_UFLOAT_BLOCK: return 0x50;
+        default: return 0;
+    }
+}
+
 // ---------- Device-wide state ----------
 static id<MTLDevice> g_dev;
+static int vk_no_bc(void) {
+    static int v = -1;
+    if (v < 0 && g_dev) { const char *e = getenv("DM_TEST_NO_BC"); v = (e && *e && strcmp(e, "0")) || ![g_dev supportsBCTextureCompression]; }
+    return v > 0;
+}
+static int vk_bc_unpack(VkFormat f, uint32_t *pf, int *bpp, uint32_t *nvn_f) {
+    uint32_t nf = vk_to_nvn_bc(f);
+    if (nvn_f) *nvn_f = nf;
+    return nf && vk_no_bc() && nvn_bc_unpacked(nf, pf, bpp);
+}
 static id<MTLCommandQueue> g_q;
 static id<MTLSharedEvent> g_ev;                 // signalled with ++g_ev_val at the end of every submit
 static id<MTLDepthStencilState> g_dss_off;      // pipelines without depth / stencil
@@ -495,7 +528,8 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
         uint32_t layers = umax(1, ci->arrayLayers), samples = umax(1, ci->samples);
         int cube = (ci->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) && layers % 6 == 0;
         MTLTextureDescriptor *td = [MTLTextureDescriptor new];
-        td.pixelFormat = f->pf; td.width = ci->extent.width; td.height = umax(1, ci->extent.height); td.depth = umax(1, ci->extent.depth);
+        uint32_t upf = 0; int ubpp = 0; int unp = vk_bc_unpack(ci->format, &upf, &ubpp, NULL);
+        td.pixelFormat = unp ? (MTLPixelFormat)upf : f->pf; td.width = ci->extent.width; td.height = umax(1, ci->extent.height); td.depth = umax(1, ci->extent.depth);
         td.mipmapLevelCount = umax(1, ci->mipLevels); td.sampleCount = samples;
         if (ci->imageType == VK_IMAGE_TYPE_3D) td.textureType = MTLTextureType3D;
         else if (ci->imageType == VK_IMAGE_TYPE_1D) td.textureType = layers > 1 ? MTLTextureType1DArray : MTLTextureType1D;
@@ -567,6 +601,7 @@ VKB(vkCreateImageView, VkResult, VkDevice d, const VkImageViewCreateInfo *ci, co
     (void)d; (void)a;
     VkImage im = ci->image; const fmt_t *f = fmt_of(ci->format);
     MTLPixelFormat pf = f && f->pf != MTLPixelFormatInvalid ? f->pf : im->f->pf;
+    { uint32_t upf = 0; int ubpp = 0; if (vk_bc_unpack(f && f->pf != MTLPixelFormatInvalid ? ci->format : im->fmt, &upf, &ubpp, NULL)) pf = (MTLPixelFormat)upf; }
     const VkImageSubresourceRange *r = &ci->subresourceRange;
     if (r->aspectMask == VK_IMAGE_ASPECT_STENCIL_BIT && pf == MTLPixelFormatDepth32Float_Stencil8) pf = MTLPixelFormatX32_Stencil8;
     uint32_t lv = r->levelCount == VK_REMAINING_MIP_LEVELS ? im->mips - r->baseMipLevel : r->levelCount;
@@ -1272,11 +1307,31 @@ static void replay(rs_t *s, VkCommandBuffer cb) {
                 const c_copyb2i *x = c; VkImage im = x->dst; const fmt_t *f = im->f;
                 if (!x->src->mem || !im->tex) { RED1("the upload buffer has no bound memory or the image was not created"); break; }
                 id<MTLBlitCommandEncoder> be = blit(s, h->op); id<MTLBuffer> sb = mem_buf(x->src->mem);
+                uint32_t upf = 0, nf = 0; int ubpp = 0, unp = vk_bc_unpack(im->fmt, &upf, &ubpp, &nf);
                 for (uint32_t i = 0; i < x->n; i++) {
                     const VkBufferImageCopy *r = &x->r[i];
                     uint32_t rl = r->bufferRowLength ? r->bufferRowLength : r->imageExtent.width, ih = r->bufferImageHeight ? r->bufferImageHeight : r->imageExtent.height;
                     NSUInteger bpr = (NSUInteger)((rl + f->bw - 1) / f->bw) * f->bytes, bpi = bpr * ((ih + f->bh - 1) / f->bh);
                     int is3d = im->type == VK_IMAGE_TYPE_3D;
+                    uint32_t nl = is3d ? r->imageExtent.depth : r->imageSubresource.layerCount;
+                    if (unp) {
+                        const uint8_t *src = (const uint8_t *)sb.contents + x->src->off + r->bufferOffset;
+                        NSUInteger up = (NSUInteger)r->imageExtent.width * ubpp, uimg = up * r->imageExtent.height;
+                        id<MTLBuffer> tb = [g_dev newBufferWithLength:(uimg * nl) ?: 16 options:MTLResourceStorageModeShared];
+                        for (uint32_t l = 0; l < nl; l++)
+                            nvn_bc_decode(nf, src + l * bpi, bpr, r->imageExtent.width, r->imageExtent.height, (uint8_t *)tb.contents + l * uimg, up);
+                        if (is3d)
+                            [be copyFromBuffer:tb sourceOffset:0 sourceBytesPerRow:up sourceBytesPerImage:uimg
+                                    sourceSize:MTLSizeMake(r->imageExtent.width, r->imageExtent.height, nl) toTexture:im->tex
+                              destinationSlice:0 destinationLevel:r->imageSubresource.mipLevel
+                             destinationOrigin:MTLOriginMake(r->imageOffset.x, r->imageOffset.y, r->imageOffset.z) options:MTLBlitOptionNone];
+                        else for (uint32_t l = 0; l < nl; l++)
+                            [be copyFromBuffer:tb sourceOffset:l * uimg sourceBytesPerRow:up sourceBytesPerImage:im->layers > 1 ? uimg : 0
+                                    sourceSize:MTLSizeMake(r->imageExtent.width, r->imageExtent.height, 1) toTexture:im->tex
+                              destinationSlice:r->imageSubresource.baseArrayLayer + l destinationLevel:r->imageSubresource.mipLevel
+                             destinationOrigin:MTLOriginMake(r->imageOffset.x, r->imageOffset.y, 0) options:MTLBlitOptionNone];
+                        continue;
+                    }
                     MTLBlitOption opt = f->kind == K_DS ? (r->imageSubresource.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT ? MTLBlitOptionStencilFromDepthStencil : MTLBlitOptionDepthFromDepthStencil) : MTLBlitOptionNone;
                     for (uint32_t l = 0; l < (is3d ? 1 : r->imageSubresource.layerCount); l++)
                         [be copyFromBuffer:sb sourceOffset:x->src->off + r->bufferOffset + l * bpi sourceBytesPerRow:bpr sourceBytesPerImage:is3d || im->layers > 1 ? bpi : 0

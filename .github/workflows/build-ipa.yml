@@ -1,0 +1,128 @@
+name: Build Switch IPA (A14 / A15 Compatible)
+
+on:
+  workflow_dispatch:
+    inputs:
+      transfer_mode:
+        description: 'Cómo enviar los archivos (.nsp y prod.keys)'
+        required: true
+        default: 'croc'
+        type: choice
+        options:
+          - croc
+          - url
+      croc_code:
+        description: 'Código secreto de croc (si elegiste modo croc)'
+        required: false
+        type: string
+      nsp_url:
+        description: 'URL directa o ID de Google Drive del NSP/ZIP (si elegiste modo url)'
+        required: false
+        type: string
+      update_url:
+        description: 'URL o ID de Google Drive del Update NSP opcional (modo url)'
+        required: false
+        type: string
+      language:
+        description: 'Idioma del juego (es, en-US, ja, fr, etc.)'
+        required: true
+        default: 'es'
+        type: string
+      show_fps:
+        description: 'Mostrar contador de FPS en pantalla'
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  build-ipa:
+    name: Build Unsigned IPA for iPhone 14 (A15) & iPad 10 (A14)
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository (with A14/A15 + BC decompression patch)
+        uses: actions/checkout@v4
+
+      - name: Free up disk space on macos-26 runner
+        run: |
+          df -h
+          rm -rf ~/Library/Android /usr/local/lib/android /opt/homebrew/Caskroom || true
+          df -h
+
+      - name: Install required build tools (XcodeGen, SPIRV-Cross, glslang, Python packages)
+        run: |
+          brew install xcodegen zstd spirv-cross glslang croc
+          python3 -m pip install --upgrade pip
+          python3 -m pip install lz4 capstone fonttools nsz gdown "backports.zstd; python_version < '3.14'"
+
+      - name: Verify iOS compilation for Apple A14 / A15 (with BC software/GPU decompression)
+        run: |
+          GAME=010015100B514000 python3 dm/ios/tools/compile_check.py
+
+      - name: Receive NSP and prod.keys via croc (from Linux PC)
+        if: ${{ inputs.transfer_mode == 'croc' }}
+        env:
+          CROC_SECRET: ${{ inputs.croc_code }}
+        run: |
+          if [ -z "$CROC_SECRET" ]; then
+            echo "::error::Debes ingresar el código de croc que te mostró el script en tu Linux."
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/payload"
+          cd "$RUNNER_TEMP/payload"
+          CROC_SECRET="$CROC_SECRET" croc --yes --overwrite
+          mkdir -p "$RUNNER_TEMP/game" "$RUNNER_TEMP/keys"
+          find . -maxdepth 3 -iname "*prod.keys*" -exec mv {} "$RUNNER_TEMP/keys/prod.keys" \;
+          find . -maxdepth 3 \( -iname "*.nsp" -o -iname "*.nsz" -o -iname "*.xci" -o -iname "*.xcz" \) -exec mv {} "$RUNNER_TEMP/game/" \;
+          ls -lh "$RUNNER_TEMP/game/" "$RUNNER_TEMP/keys/"
+
+      - name: Download NSP and prod.keys via URL / Google Drive
+        if: ${{ inputs.transfer_mode == 'url' }}
+        env:
+          NSP_URL: ${{ inputs.nsp_url }}
+          UPDATE_URL: ${{ inputs.update_url }}
+          PROD_KEYS_B64: ${{ secrets.PROD_KEYS_B64 }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/game" "$RUNNER_TEMP/keys"
+          if [ -n "$PROD_KEYS_B64" ]; then
+            echo "$PROD_KEYS_B64" | base64 --decode > "$RUNNER_TEMP/keys/prod.keys"
+          fi
+          cd "$RUNNER_TEMP/game"
+          if [[ "$NSP_URL" == http* ]] && [[ "$NSP_URL" != *"drive.google.com"* ]]; then
+            curl -L --fail -O -J "$NSP_URL"
+          else
+            gdown --fuzzy "$NSP_URL"
+          fi
+          if [ -n "$UPDATE_URL" ]; then
+            if [[ "$UPDATE_URL" == http* ]] && [[ "$UPDATE_URL" != *"drive.google.com"* ]]; then
+              curl -L --fail -O -J "$UPDATE_URL"
+            else
+              gdown --fuzzy "$UPDATE_URL"
+            fi
+          fi
+          for z in *.zip; do
+            [ -f "$z" ] && unzip -o "$z" && rm -f "$z"
+          done
+          find . -maxdepth 2 -iname "*prod.keys*" -exec mv {} "$RUNNER_TEMP/keys/prod.keys" \;
+          ls -lh "$RUNNER_TEMP/game/" "$RUNNER_TEMP/keys/"
+
+      - name: Build Unsigned IPA with nxnative
+        run: |
+          FPS_FLAG=""
+          if [ "${{ inputs.show_fps }}" = "true" ]; then
+            FPS_FLAG="--show-fps"
+          fi
+          python3 scripts/build_ipa_from_nsp.py "$RUNNER_TEMP/game" \
+            -k "$RUNNER_TEMP/keys/prod.keys" \
+            -l "${{ inputs.language }}" \
+            --no-keep-extracted \
+            $FPS_FLAG \
+            --progress lines
+
+      - name: Upload generated IPA as GitHub Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Switch-Game-IPA
+          path: ${{ runner.temp }}/game/*.ipa
+          retention-days: 7
+          compression-level: 0
