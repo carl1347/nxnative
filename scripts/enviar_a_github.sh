@@ -27,18 +27,27 @@ if ! command -v croc >/dev/null 2>&1; then
   curl https://getcroc.schollz.com | bash
 fi
 
+export PATH="$HOME/.local/bin:$PATH"
+
 CODE="nxnative-mario-$(tr -dc 'a-z0-9' </dev/urandom | head -c 8)"
 echo "=================================================================="
 echo " CÓDIGO SECRETO PARA GITHUB ACTIONS:"
 echo ""
 echo "   $CODE"
-echo ""
-echo " 1. Ve a tu Fork en GitHub -> pestaña 'Actions'"
-echo " 2. Selecciona 'Build Switch IPA (A14 / A15 Compatible)'"
-echo " 3. Haz clic en 'Run workflow', pega el código de arriba en 'croc_code'"
-echo "    y presiona el botón verde 'Run workflow'."
 echo "=================================================================="
+
+if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+  echo "🚀 Lanzando automáticamente el workflow en GitHub Actions (carl1347/nxnative)..."
+  gh workflow run build-ipa.yml -R carl1347/nxnative -f transfer_mode=croc -f croc_code="$CODE"
+  echo "✅ Workflow iniciado en https://github.com/carl1347/nxnative/actions"
+else
+  echo " 1. Ve a https://github.com/carl1347/nxnative/actions"
+  echo " 2. Selecciona 'Build Switch IPA (A14 / A15 Compatible)'"
+  echo " 3. Haz clic en 'Run workflow', pega el código de arriba en 'croc_code'"
+  echo "    y presiona el botón verde 'Run workflow'."
+fi
+
 echo ""
-echo "Esperando a que GitHub Actions se conecte para recibir los archivos..."
+echo "Esperando a que el runner macos-26 de GitHub Actions reciba los archivos..."
 
 CROC_SECRET="$CODE" croc send "$GAME_DIR" "$KEYS_FILE"
